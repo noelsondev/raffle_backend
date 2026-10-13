@@ -1,18 +1,36 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import case, func, select
-from sqlalchemy.orm import Session
 
 import io
+import logging
 import uuid
 from pathlib import Path
 
-from fastapi import File, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse
 from PIL import Image
+from sqlalchemy import case, func, select
+from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_admin
 from app.core.database import get_db
-from app.models import Admin, Raffle, RaffleStatus
+from app.models import (
+    Admin,
+    Raffle,
+    RaffleStatus,
+    Purchase,
+    PurchaseStatus,
+    Ticket,
+    TicketStatus,
+    Payment,
+    PaymentStatus,
+)
+from app.models.customer import Customer
 from app.schemas.raffle import (
     RaffleCreate,
     RaffleResponse,
@@ -20,14 +38,13 @@ from app.schemas.raffle import (
     RaffleStatusUpdate,
     RaffleUpdate,
 )
-
-from app.models import Purchase, PurchaseStatus, Ticket, TicketStatus,Payment, PaymentStatus
-from app.models.customer import Customer
 from app.services.audit import log_admin_action
-
 from app.services.supabase_storage import (
     upload_raffle_image as upload_image_to_supabase,
 )
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(
     prefix="/raffles",
     tags=["Raffles"],
@@ -55,11 +72,9 @@ def create_raffle(
         end_at=data.end_at,
     )
 
-    
     db.add(raffle)
     db.flush()
 
-    # Registrar la creación de la rifa.
     log_admin_action(
         db=db,
         admin_id=current_admin.id,
@@ -75,12 +90,10 @@ def create_raffle(
         },
     )
 
-    # Guardar la rifa y su auditoría en una sola transacción.
     db.commit()
     db.refresh(raffle)
 
     return raffle
-
 
 
 @router.get(
@@ -98,8 +111,10 @@ def list_raffles(
     )
 
 
-
-@router.get("/public/active", response_model=list[PublicRaffleResponse])
+@router.get(
+    "/public/active",
+    response_model=list[PublicRaffleResponse],
+)
 def get_active_public_raffles(
     db: Session = Depends(get_db),
 ):
@@ -113,7 +128,9 @@ def get_active_public_raffles(
     results = []
 
     for raffle in raffles:
-        assigned_statement = select(func.count(Ticket.id)).where(
+        assigned_statement = select(
+            func.count(Ticket.id)
+        ).where(
             Ticket.raffle_id == raffle.id,
             Ticket.status == TicketStatus.ASSIGNED,
         )
@@ -156,7 +173,6 @@ def get_active_public_raffles(
     return results
 
 
-
 @router.get(
     "/{raffle_id}",
     response_model=RaffleResponse,
@@ -181,7 +197,6 @@ def get_raffle(
     "/{raffle_id}",
     response_model=RaffleResponse,
 )
-
 def update_raffle(
     raffle_id: int,
     data: RaffleUpdate,
@@ -197,8 +212,6 @@ def update_raffle(
         )
 
     update_data = data.model_dump(exclude_unset=True)
-
-    # Guardar los valores anteriores antes de modificarlos.
     changes = {}
 
     for field, new_value in update_data.items():
@@ -212,13 +225,20 @@ def update_raffle(
 
         if old_value != new_value:
             changes[field] = {
-                "old": str(old_value) if old_value is not None else None,
-                "new": str(new_value) if new_value is not None else None,
+                "old": (
+                    str(old_value)
+                    if old_value is not None
+                    else None
+                ),
+                "new": (
+                    str(new_value)
+                    if new_value is not None
+                    else None
+                ),
             }
 
         setattr(raffle, field, getattr(data, field))
 
-    # Registrar solo si hubo cambios reales.
     if changes:
         db.flush()
 
@@ -231,7 +251,6 @@ def update_raffle(
             details={"changes": changes},
         )
 
-    # Guardar los cambios y la auditoría juntos.
     db.commit()
     db.refresh(raffle)
 
@@ -242,7 +261,6 @@ def update_raffle(
     "/{raffle_id}/status",
     response_model=RaffleResponse,
 )
-
 def update_raffle_status(
     raffle_id: int,
     data: RaffleStatusUpdate,
@@ -307,12 +325,10 @@ def update_raffle_status(
         },
     )
 
-    # Guardar el cambio y la auditoría juntos.
     db.commit()
     db.refresh(raffle)
 
     return raffle
-
 
 
 @router.get("/{raffle_id}/summary")
@@ -341,13 +357,19 @@ def get_raffle_summary(
         0,
     )
 
-    sold_percentage = round(
-        assigned_tickets / raffle.total_tickets * 100,
-        2,
-    ) if raffle.total_tickets > 0 else 0.0
+    sold_percentage = (
+        round(
+            assigned_tickets / raffle.total_tickets * 100,
+            2,
+        )
+        if raffle.total_tickets > 0
+        else 0.0
+    )
 
     revenue = db.scalar(
-        select(func.coalesce(func.sum(Purchase.total_amount), 0)).where(
+        select(
+            func.coalesce(func.sum(Purchase.total_amount), 0)
+        ).where(
             Purchase.raffle_id == raffle_id,
             Purchase.status == PurchaseStatus.PAID,
         )
@@ -366,44 +388,53 @@ def get_raffle_summary(
     }
 
 
-
-@router.get("/admin/dashboard", tags=["Admin Dashboard"])
-
 @router.get("/admin/dashboard", tags=["Admin Dashboard"])
 def get_admin_dashboard(
     db: Session = Depends(get_db),
     current_admin: Admin = Depends(get_current_admin),
 ):
-    # Estadísticas de rifas
     raffle_stats = db.execute(
         select(
             func.count(Raffle.id).label("total_raffles"),
             func.sum(
-                case((Raffle.status == RaffleStatus.DRAFT, 1), else_=0)
+                case(
+                    (Raffle.status == RaffleStatus.DRAFT, 1),
+                    else_=0,
+                )
             ).label("draft_raffles"),
             func.sum(
-                case((Raffle.status == RaffleStatus.ACTIVE, 1), else_=0)
+                case(
+                    (Raffle.status == RaffleStatus.ACTIVE, 1),
+                    else_=0,
+                )
             ).label("active_raffles"),
             func.sum(
-                case((Raffle.status == RaffleStatus.PAUSED, 1), else_=0)
+                case(
+                    (Raffle.status == RaffleStatus.PAUSED, 1),
+                    else_=0,
+                )
             ).label("paused_raffles"),
             func.sum(
-                case((Raffle.status == RaffleStatus.FINISHED, 1), else_=0)
+                case(
+                    (Raffle.status == RaffleStatus.FINISHED, 1),
+                    else_=0,
+                )
             ).label("finished_raffles"),
             func.sum(
-                case((Raffle.status == RaffleStatus.CANCELLED, 1), else_=0)
+                case(
+                    (Raffle.status == RaffleStatus.CANCELLED, 1),
+                    else_=0,
+                )
             ).label("cancelled_raffles"),
         )
     ).one()
 
-    # Estadísticas de tickets
     assigned_tickets = db.scalar(
         select(func.count(Ticket.id)).where(
             Ticket.status == TicketStatus.ASSIGNED
         )
     ) or 0
 
-    # Estadísticas de pagos
     pending_payments = db.scalar(
         select(func.count(Payment.id)).where(
             Payment.status == PaymentStatus.PENDING
@@ -416,17 +447,17 @@ def get_admin_dashboard(
         )
     ) or 0
 
-    # Estadísticas de compras
     pending_purchases = db.scalar(
         select(func.count(Purchase.id)).where(
-            Purchase.status.in_([
-                PurchaseStatus.PENDING_PAYMENT,
-                PurchaseStatus.PAYMENT_SUBMITTED,
-            ])
+            Purchase.status.in_(
+                [
+                    PurchaseStatus.PENDING_PAYMENT,
+                    PurchaseStatus.PAYMENT_SUBMITTED,
+                ]
+            )
         )
     ) or 0
 
-    # Ingresos de compras pagadas
     revenue = db.scalar(
         select(
             func.coalesce(func.sum(Purchase.total_amount), 0)
@@ -435,7 +466,6 @@ def get_admin_dashboard(
         )
     )
 
-    # Total de clientes registrados
     total_customers = db.scalar(
         select(func.count(Customer.id))
     ) or 0
@@ -454,7 +484,6 @@ def get_admin_dashboard(
         "total_customers": total_customers,
         "confirmed_revenue": str(revenue),
     }
-
 
 
 @router.post("/{raffle_id}/image")
@@ -498,11 +527,11 @@ def upload_raffle_image(
         with Image.open(io.BytesIO(content)) as image:
             image_format = image.format
             image.verify()
-    except Exception:
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="El archivo no es una imagen válida.",
-        )
+        ) from exc
 
     if image_format not in allowed_formats:
         raise HTTPException(
@@ -520,7 +549,6 @@ def upload_raffle_image(
             content_type=content_type,
         )
 
-        old_image_path = raffle.image_path
         raffle.image_path = public_url
 
         log_admin_action(
@@ -546,6 +574,13 @@ def upload_raffle_image(
 
     except Exception as exc:
         db.rollback()
+
+        logger.exception(
+            "Error al subir imagen de la rifa a Supabase. "
+            "Rifa ID: %s",
+            raffle_id,
+        )
+
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="No se pudo subir la imagen a Supabase.",
