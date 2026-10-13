@@ -16,6 +16,7 @@ from app.models import Admin, Raffle, RaffleStatus
 from app.schemas.raffle import (
     RaffleCreate,
     RaffleResponse,
+    PublicRaffleResponse,
     RaffleStatusUpdate,
     RaffleUpdate,
 )
@@ -95,7 +96,8 @@ def list_raffles(
     )
 
 
-@router.get("/public/active", response_model=list[RaffleResponse])
+
+@router.get("/public/active", response_model=list[PublicRaffleResponse])
 def get_active_public_raffles(
     db: Session = Depends(get_db),
 ):
@@ -106,7 +108,51 @@ def get_active_public_raffles(
     )
 
     raffles = db.scalars(statement).all()
-    return raffles
+    results = []
+
+    for raffle in raffles:
+        assigned_statement = select(func.count(Ticket.id)).where(
+            Ticket.raffle_id == raffle.id,
+            Ticket.status == TicketStatus.ASSIGNED,
+        )
+
+        sold_tickets = db.scalar(assigned_statement) or 0
+
+        if raffle.total_tickets > 0:
+            sold_percentage = round(
+                sold_tickets / raffle.total_tickets * 100,
+                2,
+            )
+        else:
+            sold_percentage = 0.0
+
+        remaining_percentage = round(
+            max(0.0, 100.0 - sold_percentage),
+            2,
+        )
+
+        results.append(
+            {
+                "id": raffle.id,
+                "title": raffle.title,
+                "description": raffle.description,
+                "image_path": raffle.image_path,
+                "price": raffle.price,
+                "total_tickets": raffle.total_tickets,
+                "minimum_tickets": raffle.minimum_tickets,
+                "status": raffle.status,
+                "start_at": raffle.start_at,
+                "end_at": raffle.end_at,
+                "created_at": raffle.created_at,
+                "updated_at": raffle.updated_at,
+                "sold_tickets": sold_tickets,
+                "sold_percentage": sold_percentage,
+                "remaining_percentage": remaining_percentage,
+            }
+        )
+
+    return results
+
 
 
 @router.get(

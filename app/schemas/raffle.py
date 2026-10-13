@@ -42,6 +42,11 @@ class RaffleResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+class PublicRaffleResponse(RaffleResponse):
+    sold_tickets: int = 0
+    sold_percentage: float = 0.0
+    remaining_percentage: float = 100.0
+
 
 class RaffleStatusUpdate(BaseModel):
     status: RaffleStatus
