@@ -95,6 +95,20 @@ def list_raffles(
     )
 
 
+@router.get("/public/active", response_model=list[RaffleResponse])
+def get_active_public_raffles(
+    db: Session = Depends(get_db),
+):
+    statement = (
+        select(Raffle)
+        .where(Raffle.status == RaffleStatus.ACTIVE)
+        .order_by(Raffle.created_at.desc())
+    )
+
+    raffles = db.scalars(statement).all()
+    return raffles
+
+
 @router.get(
     "/{raffle_id}",
     response_model=RaffleResponse,
