@@ -15,6 +15,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.responses import FileResponse, Response
 from PIL import Image
 from sqlalchemy.orm import Session
 
@@ -28,11 +29,13 @@ from app.models.raffle import Raffle, RaffleStatus
 from app.models.ticket import Ticket, TicketStatus
 from app.schemas.payment import PaymentReview
 from app.services.audit import log_admin_action
+from app.services.supabase_storage import get_supabase_client
 
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
 PROOF_DIR = Path("storage/payment-proofs")
+PROOF_BUCKET = "payment-proofs"
 MAX_FILE_SIZE = 5 * 1024 * 1024
 
 ALLOWED_TYPES = {
@@ -40,6 +43,25 @@ ALLOWED_TYPES = {
     "image/png": ".png",
     "image/webp": ".webp",
 }
+
+MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+def delete_supabase_proof(object_path: str) -> None:
+    """Intenta eliminar un comprobante de Supabase."""
+    try:
+        client = get_supabase_client()
+        client.storage.from_(PROOF_BUCKET).remove([object_path])
+    except Exception:
+        logging.exception(
+            "No se pudo eliminar el comprobante %s de Supabase.",
+            object_path,
+        )
 
 
 @router.post("/proof", status_code=status.HTTP_201_CREATED)
@@ -98,7 +120,8 @@ async def upload_payment_proof(
             detail="Formato no permitido. Usa JPG, PNG o WEBP.",
         )
 
-    destination = None
+    object_path = None
+    uploaded_to_storage = False
 
     try:
         content = await file.read(MAX_FILE_SIZE + 1)
@@ -126,19 +149,33 @@ async def upload_payment_proof(
                 detail="El archivo no contiene una imagen válida.",
             ) from exc
 
-        PROOF_DIR.mkdir(parents=True, exist_ok=True)
-        filename = f"{uuid4().hex}{extension}"
-        destination = PROOF_DIR / filename
+        # Cada comprobante tiene una ruta única dentro del bucket privado.
+        object_path = (
+            f"{purchase.id}/{uuid4().hex}{extension}"
+        )
 
-        destination.write_bytes(content)
+        client = get_supabase_client()
+
+        client.storage.from_(PROOF_BUCKET).upload(
+            path=object_path,
+            file=content,
+            file_options={
+                "content-type": file.content_type,
+                "upsert": "false",
+            },
+        )
+
+        uploaded_to_storage = True
 
         payment = Payment(
             purchase_id=purchase.id,
-            proof_path=str(destination.as_posix()),
+            # Guardamos la ruta del objeto, nunca una URL pública.
+            proof_path=object_path,
             status=PaymentStatus.PENDING,
         )
 
         purchase.status = PurchaseStatus.PAYMENT_SUBMITTED
+
         db.add(payment)
         db.commit()
         db.refresh(payment)
@@ -152,15 +189,17 @@ async def upload_payment_proof(
 
     except HTTPException:
         db.rollback()
-        if destination is not None:
-            destination.unlink(missing_ok=True)
+
+        if uploaded_to_storage and object_path:
+            delete_supabase_proof(object_path)
+
         raise
 
     except Exception as exc:
         db.rollback()
 
-        if destination is not None:
-            destination.unlink(missing_ok=True)
+        if uploaded_to_storage and object_path:
+            delete_supabase_proof(object_path)
 
         logging.exception("Error registrando el comprobante.")
 
@@ -229,29 +268,16 @@ def view_payment_proof(
             detail="Pago no encontrado.",
         )
 
-    proof_path = Path(payment.proof_path).resolve()
-    allowed_dir = PROOF_DIR.resolve()
+    stored_path = payment.proof_path
 
-    if not proof_path.is_relative_to(allowed_dir):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Ruta del comprobante no permitida.",
-        )
-
-    if not proof_path.is_file():
+    if not stored_path:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="El archivo del comprobante no existe.",
+            detail="El pago no tiene un comprobante registrado.",
         )
 
-    media_types = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-    }
-
-    media_type = media_types.get(proof_path.suffix.lower())
+    suffix = Path(stored_path).suffix.lower()
+    media_type = MEDIA_TYPES.get(suffix)
 
     if media_type is None:
         raise HTTPException(
@@ -259,17 +285,67 @@ def view_payment_proof(
             detail="Formato del comprobante no permitido.",
         )
 
-    from fastapi.responses import FileResponse
+    # Compatibilidad con comprobantes antiguos guardados en el disco.
+    legacy_path = Path(stored_path)
+    legacy_prefix = Path("storage") / "payment-proofs"
 
-    return FileResponse(
-        path=proof_path,
-        media_type=media_type,
-        content_disposition_type="inline",
-        headers={
-            "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "private, no-store",
-        },
-    )
+    if (
+        not legacy_path.is_absolute()
+        and legacy_path.parts[:2] == legacy_prefix.parts
+    ):
+        proof_path = legacy_path.resolve()
+        allowed_dir = PROOF_DIR.resolve()
+
+        if not proof_path.is_relative_to(allowed_dir):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Ruta del comprobante no permitida.",
+            )
+
+        if not proof_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="El archivo antiguo del comprobante no existe.",
+            )
+
+        return FileResponse(
+            path=proof_path,
+            media_type=media_type,
+            content_disposition_type="inline",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+            },
+        )
+
+    # Las rutas nuevas son claves privadas de Supabase Storage.
+    try:
+        client = get_supabase_client()
+
+        content = client.storage.from_(PROOF_BUCKET).download(
+            stored_path
+        )
+
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": "inline",
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+            },
+        )
+
+    except Exception as exc:
+        logging.exception(
+            "Error recuperando el comprobante del pago %s.",
+            payment_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="No se pudo recuperar el comprobante almacenado.",
+        ) from exc
 
 
 @router.patch("/{payment_id}/review")
@@ -326,7 +402,6 @@ def review_payment(
     assigned_numbers = []
 
     try:
-        # La aprobación necesita verificar y bloquear la rifa.
         if data.decision == "approve":
             raffle = (
                 db.query(Raffle)
@@ -350,8 +425,6 @@ def review_payment(
                     detail="La rifa está finalizada o cancelada.",
                 )
 
-            # Todos los números ya registrados están ocupados,
-            # incluidos los boletos cancelados.
             existing_numbers = {
                 number
                 for (number,) in (
@@ -396,7 +469,6 @@ def review_payment(
             purchase.status = PurchaseStatus.PAID
 
         else:
-            # La compra rechazada deja de reservar disponibilidad.
             payment.status = PaymentStatus.REJECTED
             purchase.status = PurchaseStatus.REJECTED
 
