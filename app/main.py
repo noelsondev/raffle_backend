@@ -33,7 +33,10 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-STORAGE_DIR = Path("storage")
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+STORAGE_DIR = BASE_DIR / "storage"
 RAFFLE_IMAGES_DIR = STORAGE_DIR / "raffle-images"
 
 RAFFLE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,6 +46,7 @@ app.mount(
     StaticFiles(directory=str(STORAGE_DIR)),
     name="storage",
 )
+
 
 app.include_router(auth_router, prefix="/api/v1")
 app.include_router(raffles_router, prefix="/api/v1")
