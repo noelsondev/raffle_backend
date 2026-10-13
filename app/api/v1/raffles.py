@@ -25,7 +25,9 @@ from app.models import Purchase, PurchaseStatus, Ticket, TicketStatus,Payment, P
 from app.models.customer import Customer
 from app.services.audit import log_admin_action
 
-
+from app.services.supabase_storage import (
+    upload_raffle_image as upload_image_to_supabase,
+)
 router = APIRouter(
     prefix="/raffles",
     tags=["Raffles"],
@@ -454,6 +456,7 @@ def get_admin_dashboard(
     }
 
 
+
 @router.post("/{raffle_id}/image")
 def upload_raffle_image(
     raffle_id: int,
@@ -464,9 +467,9 @@ def upload_raffle_image(
     max_file_size = 5 * 1024 * 1024
 
     allowed_formats = {
-        "JPEG": ".jpg",
-        "PNG": ".png",
-        "WEBP": ".webp",
+        "JPEG": (".jpg", "image/jpeg"),
+        "PNG": (".png", "image/png"),
+        "WEBP": (".webp", "image/webp"),
     }
 
     raffle = db.get(Raffle, raffle_id)
@@ -507,17 +510,18 @@ def upload_raffle_image(
             detail="Solo se permiten imágenes JPG, PNG o WEBP.",
         )
 
-    image_dir = Path("storage/raffle-images")
-    image_dir.mkdir(parents=True, exist_ok=True)
-
-    filename = f"{uuid.uuid4().hex}{allowed_formats[image_format]}"
-    destination = image_dir / filename
-    old_image_path = raffle.image_path
+    extension, content_type = allowed_formats[image_format]
+    safe_filename = f"image{extension}"
 
     try:
-        destination.write_bytes(content)
+        public_url = upload_image_to_supabase(
+            file_bytes=content,
+            original_filename=safe_filename,
+            content_type=content_type,
+        )
 
-        raffle.image_path = f"/storage/raffle-images/{filename}"
+        old_image_path = raffle.image_path
+        raffle.image_path = public_url
 
         log_admin_action(
             db=db,
@@ -526,30 +530,26 @@ def upload_raffle_image(
             entity_type="raffle",
             entity_id=raffle.id,
             details={
-                "image_path": raffle.image_path,
+                "image_path": public_url,
             },
         )
 
         db.commit()
         db.refresh(raffle)
 
-    except Exception:
+    except ValueError as exc:
         db.rollback()
-        destination.unlink(missing_ok=True)
-        raise
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
-    # Eliminar la imagen anterior solo si pertenece
-    # a la carpeta exclusiva de imágenes de rifas.
-    if old_image_path:
-        old_filename = Path(old_image_path).name
-        old_file = image_dir / old_filename
-
-        if (
-            old_image_path.startswith("/storage/raffle-images/")
-            and old_file != destination
-            and old_file.is_file()
-        ):
-            old_file.unlink(missing_ok=True)
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="No se pudo subir la imagen a Supabase.",
+        ) from exc
 
     return {
         "message": "Imagen de la rifa actualizada correctamente.",
